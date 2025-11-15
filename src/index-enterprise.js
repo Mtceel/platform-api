@@ -1,0 +1,747 @@
+import express from 'express';
+import cors from 'cors';
+import pg from 'pg';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { createClient } from 'redis';
+
+const app = express();
+app.use(cors({
+  origin: '*',
+  credentials: true
+}));
+app.use(express.json({ limit: '10mb' }));
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-prod-CHANGE-THIS';
+const SUPER_ADMIN_EMAIL = process.env.SUPER_ADMIN_EMAIL || 'admin@fv-company.com';
+const SUPER_ADMIN_PASSWORD_HASH = process.env.SUPER_ADMIN_PASSWORD_HASH; // Set via env
+
+// Database connection with connection pooling
+const db = new pg.Pool({
+  host: process.env.DB_HOST || 'postgres.platform-services.svc.cluster.local',
+  port: 5432,
+  database: 'saas_platform',
+  user: 'postgres',
+  password: 'postgres123',
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+// Redis connection
+const redis = createClient({
+  url: `redis://${process.env.REDIS_HOST || 'redis.platform-services.svc.cluster.local'}:6379`
+});
+redis.on('error', err => console.log('Redis error:', err));
+await redis.connect();
+
+// Rate limiting helper
+const rateLimitCache = new Map();
+const rateLimit = (key, maxRequests, windowMs) => {
+  const now = Date.now();
+  const requests = rateLimitCache.get(key) || [];
+  const recentRequests = requests.filter(time => now - time < windowMs);
+  
+  if (recentRequests.length >= maxRequests) {
+    return false;
+  }
+  
+  recentRequests.push(now);
+  rateLimitCache.set(key, recentRequests);
+  return true;
+};
+
+// Auth middleware
+const authMiddleware = async (req, res, next) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.userId;
+    req.tenantId = decoded.tenantId;
+    req.userRole = decoded.role || 'merchant';
+    
+    // Audit log
+    await db.query(
+      'INSERT INTO audit_logs (user_id, tenant_id, action, endpoint, ip_address) VALUES ($1, $2, $3, $4, $5)',
+      [req.userId, req.tenantId, req.method, req.path, req.ip]
+    );
+    
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// Super admin middleware
+const superAdminMiddleware = async (req, res, next) => {
+  if (req.userRole !== 'super_admin') {
+    return res.status(403).json({ error: 'Super admin access required' });
+  }
+  next();
+};
+
+// Rate limit middleware
+const rateLimitMiddleware = (maxRequests = 100, windowMs = 60000) => {
+  return (req, res, next) => {
+    const key = `${req.ip}:${req.path}`;
+    if (!rateLimit(key, maxRequests, windowMs)) {
+      return res.status(429).json({ error: 'Too many requests' });
+    }
+    next();
+  };
+};
+
+// === HEALTH & STATUS ===
+
+app.get('/health', async (req, res) => {
+  try {
+    // Check database
+    await db.query('SELECT 1');
+    
+    // Check Redis
+    await redis.ping();
+    
+    res.json({
+      status: 'healthy',
+      service: 'platform-api-enterprise',
+      version: '2.0.0',
+      timestamp: new Date().toISOString(),
+      checks: {
+        database: 'healthy',
+        redis: 'healthy'
+      }
+    });
+  } catch (err) {
+    res.status(503).json({
+      status: 'unhealthy',
+      error: err.message
+    });
+  }
+});
+
+app.get('/api/status', async (req, res) => {
+  try {
+    const dbStart = Date.now();
+    await db.query('SELECT 1');
+    const dbLatency = Date.now() - dbStart;
+    
+    const redisStart = Date.now();
+    await redis.ping();
+    const redisLatency = Date.now() - redisStart;
+    
+    const stats = await db.query(`
+      SELECT 
+        (SELECT COUNT(*) FROM tenants) as total_tenants,
+        (SELECT COUNT(*) FROM users) as total_users,
+        (SELECT COUNT(*) FROM products) as total_products,
+        (SELECT COUNT(*) FROM orders) as total_orders,
+        (SELECT SUM(total) FROM orders WHERE status = 'completed') as total_revenue
+    `);
+    
+    res.json({
+      status: 'operational',
+      timestamp: new Date().toISOString(),
+      services: {
+        api: { status: 'operational', latency: 0 },
+        database: { status: 'operational', latency: dbLatency },
+        redis: { status: 'operational', latency: redisLatency },
+        storefront: { status: 'operational' },
+        dashboard: { status: 'operational' }
+      },
+      metrics: stats.rows[0]
+    });
+  } catch (err) {
+    res.status(503).json({
+      status: 'degraded',
+      error: err.message
+    });
+  }
+});
+
+// === AUTH ENDPOINTS ===
+
+app.post('/api/signup', rateLimitMiddleware(10, 3600000), async (req, res) => {
+  const { email, password, fullName, storeName, subdomain } = req.body;
+  
+  if (!email || !password || !storeName || !subdomain) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  
+  // Validate subdomain
+  if (!/^[a-z0-9-]+$/.test(subdomain)) {
+    return res.status(400).json({ error: 'Invalid subdomain format. Use only lowercase letters, numbers, and hyphens.' });
+  }
+  
+  if (subdomain.length < 3 || subdomain.length > 63) {
+    return res.status(400).json({ error: 'Subdomain must be between 3 and 63 characters' });
+  }
+  
+  // Reserved subdomains
+  const reserved = ['www', 'api', 'admin', 'dashboard', 'status', 'mail', 'ftp', 'cdn', 'static'];
+  if (reserved.includes(subdomain)) {
+    return res.status(400).json({ error: 'This subdomain is reserved' });
+  }
+  
+  const client = await db.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    // Check if email exists
+    const userCheck = await client.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (userCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'Email already registered' });
+    }
+    
+    // Check if subdomain exists
+    const subdomainCheck = await client.query('SELECT id FROM tenants WHERE subdomain = $1', [subdomain]);
+    if (subdomainCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'Subdomain already taken' });
+    }
+    
+    // Create user
+    const passwordHash = await bcrypt.hash(password, 10);
+    const userResult = await client.query(
+      'INSERT INTO users (email, password_hash, full_name, role) VALUES ($1, $2, $3, $4) RETURNING id',
+      [email, passwordHash, fullName, 'merchant']
+    );
+    const userId = userResult.rows[0].id;
+    
+    // Create tenant
+    const tenantResult = await client.query(
+      'INSERT INTO tenants (user_id, subdomain, store_name, plan, status) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+      [userId, subdomain, storeName, 'free', 'active']
+    );
+    const tenantId = tenantResult.rows[0].id;
+    
+    // Create default theme
+    await client.query(
+      'INSERT INTO themes (tenant_id, name, is_active) VALUES ($1, $2, $3)',
+      [tenantId, 'Default', true]
+    );
+    
+    // Cache subdomain mapping
+    await redis.set(`subdomain:${subdomain}`, tenantId.toString(), { EX: 86400 });
+    
+    await client.query('COMMIT');
+    
+    // Generate token
+    const token = jwt.sign({ userId, tenantId, role: 'merchant' }, JWT_SECRET, { expiresIn: '7d' });
+    
+    res.json({
+      success: true,
+      token,
+      user: { id: userId, email, fullName },
+      tenant: { id: tenantId, subdomain, storeName, storeUrl: `https://${subdomain}.fv-company.com` }
+    });
+    
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Signup error:', err);
+    res.status(500).json({ error: 'Signup failed' });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/login', rateLimitMiddleware(20, 3600000), async (req, res) => {
+  const { email, password } = req.body;
+  
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password required' });
+  }
+  
+  try {
+    // Check super admin
+    if (email === SUPER_ADMIN_EMAIL && SUPER_ADMIN_PASSWORD_HASH) {
+      const match = await bcrypt.compare(password, SUPER_ADMIN_PASSWORD_HASH);
+      if (match) {
+        const token = jwt.sign({ userId: 0, tenantId: 0, role: 'super_admin' }, JWT_SECRET, { expiresIn: '24h' });
+        return res.json({
+          success: true,
+          token,
+          user: { id: 0, email, fullName: 'Super Admin', role: 'super_admin' }
+        });
+      }
+    }
+    
+    // Regular merchant login
+    const result = await db.query(
+      'SELECT u.id, u.email, u.password_hash, u.full_name, u.role, t.id as tenant_id, t.subdomain, t.store_name FROM users u LEFT JOIN tenants t ON u.id = t.user_id WHERE u.email = $1',
+      [email]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const user = result.rows[0];
+    const match = await bcrypt.compare(password, user.password_hash);
+    
+    if (!match) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const token = jwt.sign({ userId: user.id, tenantId: user.tenant_id, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+    
+    res.json({
+      success: true,
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.full_name,
+        role: user.role
+      },
+      tenant: user.tenant_id ? {
+        id: user.tenant_id,
+        subdomain: user.subdomain,
+        storeName: user.store_name,
+        storeUrl: `https://${user.subdomain}.fv-company.com`
+      } : null
+    });
+    
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// === SUPER ADMIN ENDPOINTS ===
+
+app.get('/api/admin/tenants', authMiddleware, superAdminMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT 
+        t.id,
+        t.subdomain,
+        t.store_name,
+        t.custom_domain,
+        t.plan,
+        t.status,
+        t.created_at,
+        u.email as owner_email,
+        u.full_name as owner_name,
+        (SELECT COUNT(*) FROM products WHERE tenant_id = t.id) as product_count,
+        (SELECT COUNT(*) FROM orders WHERE tenant_id = t.id) as order_count,
+        (SELECT COALESCE(SUM(total), 0) FROM orders WHERE tenant_id = t.id AND status = 'completed') as total_revenue
+      FROM tenants t
+      JOIN users u ON t.user_id = u.id
+      ORDER BY t.created_at DESC
+    `);
+    
+    res.json({ tenants: result.rows });
+  } catch (err) {
+    console.error('Admin tenants error:', err);
+    res.status(500).json({ error: 'Failed to fetch tenants' });
+  }
+});
+
+app.get('/api/admin/stats', authMiddleware, superAdminMiddleware, async (req, res) => {
+  try {
+    const stats = await db.query(`
+      SELECT 
+        (SELECT COUNT(*) FROM tenants) as total_tenants,
+        (SELECT COUNT(*) FROM tenants WHERE status = 'active') as active_tenants,
+        (SELECT COUNT(*) FROM users) as total_users,
+        (SELECT COUNT(*) FROM products) as total_products,
+        (SELECT COUNT(*) FROM orders) as total_orders,
+        (SELECT COALESCE(SUM(total), 0) FROM orders WHERE status = 'completed') as total_revenue,
+        (SELECT COUNT(*) FROM orders WHERE created_at > NOW() - INTERVAL '24 hours') as orders_today,
+        (SELECT COALESCE(SUM(total), 0) FROM orders WHERE created_at > NOW() - INTERVAL '30 days' AND status = 'completed') as revenue_30days
+    `);
+    
+    res.json({ stats: stats.rows[0] });
+  } catch (err) {
+    console.error('Admin stats error:', err);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+app.patch('/api/admin/tenants/:id/status', authMiddleware, superAdminMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  
+  if (!['active', 'suspended', 'deleted'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+  
+  try {
+    await db.query('UPDATE tenants SET status = $1 WHERE id = $2', [status, id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Update status error:', err);
+    res.status(500).json({ error: 'Failed to update status' });
+  }
+});
+
+// === MERCHANT DASHBOARD ENDPOINTS ===
+
+app.get('/api/dashboard/stats', authMiddleware, async (req, res) => {
+  try {
+    const stats = await db.query(`
+      SELECT 
+        (SELECT COUNT(*) FROM products WHERE tenant_id = $1) as product_count,
+        (SELECT COUNT(*) FROM orders WHERE tenant_id = $1) as order_count,
+        (SELECT COALESCE(SUM(total), 0) FROM orders WHERE tenant_id = $1 AND status = 'completed') as total_revenue,
+        (SELECT COUNT(*) FROM orders WHERE tenant_id = $1 AND created_at > NOW() - INTERVAL '24 hours') as orders_today,
+        (SELECT COALESCE(SUM(total), 0) FROM orders WHERE tenant_id = $1 AND created_at > NOW() - INTERVAL '30 days' AND status = 'completed') as revenue_30days
+    `, [req.tenantId]);
+    
+    res.json({ stats: stats.rows[0] });
+  } catch (err) {
+    console.error('Dashboard stats error:', err);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// === PRODUCTS ===
+
+app.get('/api/products', authMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT * FROM products WHERE tenant_id = $1 ORDER BY created_at DESC',
+      [req.tenantId]
+    );
+    res.json({ products: result.rows });
+  } catch (err) {
+    console.error('Get products error:', err);
+    res.status(500).json({ error: 'Failed to fetch products' });
+  }
+});
+
+app.post('/api/products', authMiddleware, rateLimitMiddleware(50, 60000), async (req, res) => {
+  const { title, description, price, inventory, sku, image_url, category, tags } = req.body;
+  
+  if (!title || price === undefined) {
+    return res.status(400).json({ error: 'Title and price are required' });
+  }
+  
+  try {
+    const result = await db.query(
+      `INSERT INTO products (tenant_id, title, description, price, inventory, sku, image_url, category, tags, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [req.tenantId, title, description, price, inventory || 0, sku, image_url, category, tags, 'active']
+    );
+    
+    res.json({ success: true, product: result.rows[0] });
+  } catch (err) {
+    console.error('Create product error:', err);
+    res.status(500).json({ error: 'Failed to create product' });
+  }
+});
+
+app.put('/api/products/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { title, description, price, inventory, sku, image_url, category, tags, status } = req.body;
+  
+  try {
+    const result = await db.query(
+      `UPDATE products 
+       SET title = COALESCE($1, title),
+           description = COALESCE($2, description),
+           price = COALESCE($3, price),
+           inventory = COALESCE($4, inventory),
+           sku = COALESCE($5, sku),
+           image_url = COALESCE($6, image_url),
+           category = COALESCE($7, category),
+           tags = COALESCE($8, tags),
+           status = COALESCE($9, status)
+       WHERE id = $10 AND tenant_id = $11
+       RETURNING *`,
+      [title, description, price, inventory, sku, image_url, category, tags, status, id, req.tenantId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    
+    res.json({ success: true, product: result.rows[0] });
+  } catch (err) {
+    console.error('Update product error:', err);
+    res.status(500).json({ error: 'Failed to update product' });
+  }
+});
+
+app.delete('/api/products/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const result = await db.query('DELETE FROM products WHERE id = $1 AND tenant_id = $2 RETURNING id', [id, req.tenantId]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete product error:', err);
+    res.status(500).json({ error: 'Failed to delete product' });
+  }
+});
+
+// === ORDERS ===
+
+app.get('/api/orders', authMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT * FROM orders WHERE tenant_id = $1 ORDER BY created_at DESC',
+      [req.tenantId]
+    );
+    res.json({ orders: result.rows });
+  } catch (err) {
+    console.error('Get orders error:', err);
+    res.status(500).json({ error: 'Failed to fetch orders' });
+  }
+});
+
+app.patch('/api/orders/:id/status', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  
+  if (!['pending', 'processing', 'completed', 'cancelled'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+  
+  try {
+    await db.query(
+      'UPDATE orders SET status = $1 WHERE id = $2 AND tenant_id = $3',
+      [status, id, req.tenantId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Update order status error:', err);
+    res.status(500).json({ error: 'Failed to update order' });
+  }
+});
+
+// === STOREFRONT PUBLIC ENDPOINTS ===
+
+app.get('/api/storefront/:subdomain', async (req, res) => {
+  const { subdomain } = req.params;
+  
+  try {
+    // Check cache first
+    let tenantId = await redis.get(`subdomain:${subdomain}`);
+    
+    if (!tenantId) {
+      // Fallback to database
+      const tenantResult = await db.query(
+        'SELECT id, store_name, custom_domain, status FROM tenants WHERE subdomain = $1',
+        [subdomain]
+      );
+      
+      if (tenantResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Store not found' });
+      }
+      
+      const tenant = tenantResult.rows[0];
+      
+      if (tenant.status !== 'active') {
+        return res.status(403).json({ error: 'Store is not active' });
+      }
+      
+      tenantId = tenant.id;
+      
+      // Cache for 1 hour
+      await redis.set(`subdomain:${subdomain}`, tenantId.toString(), { EX: 3600 });
+    }
+    
+    // Fetch store data
+    const storeResult = await db.query(
+      'SELECT id, store_name, subdomain, custom_domain FROM tenants WHERE id = $1',
+      [tenantId]
+    );
+    
+    const productsResult = await db.query(
+      'SELECT id, title, description, price, inventory, image_url, category, tags FROM products WHERE tenant_id = $1 AND status = $2 ORDER BY created_at DESC',
+      [tenantId, 'active']
+    );
+    
+    res.json({
+      store: storeResult.rows[0],
+      products: productsResult.rows
+    });
+    
+  } catch (err) {
+    console.error('Storefront error:', err);
+    res.status(500).json({ error: 'Failed to load store' });
+  }
+});
+
+app.post('/api/checkout', rateLimitMiddleware(10, 60000), async (req, res) => {
+  const { subdomain, cart, customerName, customerEmail, shippingAddress } = req.body;
+  
+  if (!subdomain || !cart || cart.length === 0 || !customerEmail) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  
+  const client = await db.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    // Get tenant
+    const tenantResult = await client.query('SELECT id FROM tenants WHERE subdomain = $1', [subdomain]);
+    if (tenantResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Store not found' });
+    }
+    const tenantId = tenantResult.rows[0].id;
+    
+    // Calculate total and verify inventory
+    let total = 0;
+    for (const item of cart) {
+      const productResult = await client.query(
+        'SELECT price, inventory FROM products WHERE id = $1 AND tenant_id = $2',
+        [item.id, tenantId]
+      );
+      
+      if (productResult.rows.length === 0) {
+        throw new Error(`Product ${item.id} not found`);
+      }
+      
+      const product = productResult.rows[0];
+      
+      if (product.inventory < item.quantity) {
+        throw new Error(`Insufficient inventory for product ${item.id}`);
+      }
+      
+      total += product.price * item.quantity;
+      
+      // Decrease inventory
+      await client.query(
+        'UPDATE products SET inventory = inventory - $1 WHERE id = $2',
+        [item.quantity, item.id]
+      );
+    }
+    
+    // Create order
+    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+    const orderResult = await client.query(
+      `INSERT INTO orders (tenant_id, order_number, customer_email, customer_name, shipping_address, total, items, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [tenantId, orderNumber, customerEmail, customerName, shippingAddress, total, JSON.stringify(cart), 'pending']
+    );
+    
+    await client.query('COMMIT');
+    
+    res.json({
+      success: true,
+      order: orderResult.rows[0]
+    });
+    
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Checkout error:', err);
+    res.status(500).json({ error: err.message || 'Checkout failed' });
+  } finally {
+    client.release();
+  }
+});
+
+// === THEMES & CUSTOMIZATION ===
+
+app.get('/api/themes', authMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT * FROM themes WHERE tenant_id = $1 ORDER BY created_at DESC',
+      [req.tenantId]
+    );
+    res.json({ themes: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch themes' });
+  }
+});
+
+app.post('/api/themes', authMiddleware, async (req, res) => {
+  const { name, settings } = req.body;
+  
+  try {
+    const result = await db.query(
+      'INSERT INTO themes (tenant_id, name, settings) VALUES ($1, $2, $3) RETURNING *',
+      [req.tenantId, name, settings || {}]
+    );
+    res.json({ success: true, theme: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create theme' });
+  }
+});
+
+app.patch('/api/themes/:id/activate', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE themes SET is_active = false WHERE tenant_id = $1', [req.tenantId]);
+    await client.query('UPDATE themes SET is_active = true WHERE id = $1 AND tenant_id = $2', [id, req.tenantId]);
+    await client.query('COMMIT');
+    
+    res.json({ success: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Failed to activate theme' });
+  } finally {
+    client.release();
+  }
+});
+
+// === CUSTOM DOMAINS ===
+
+app.post('/api/custom-domain', authMiddleware, async (req, res) => {
+  const { domain } = req.body;
+  
+  if (!domain) {
+    return res.status(400).json({ error: 'Domain is required' });
+  }
+  
+  try {
+    await db.query(
+      'UPDATE tenants SET custom_domain = $1 WHERE id = $2',
+      [domain, req.tenantId]
+    );
+    
+    // Cache domain mapping
+    await redis.set(`domain:${domain}`, req.tenantId.toString(), { EX: 86400 });
+    
+    res.json({ 
+      success: true, 
+      message: 'Custom domain added. Please point your DNS CNAME to fv-company.com'
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to add custom domain' });
+  }
+});
+
+// === ANALYTICS ===
+
+app.get('/api/analytics/overview', authMiddleware, async (req, res) => {
+  const { days = 30 } = req.query;
+  
+  try {
+    const result = await db.query(`
+      SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as orders,
+        SUM(total) as revenue
+      FROM orders
+      WHERE tenant_id = $1 AND created_at > NOW() - INTERVAL '${parseInt(days)} days'
+      GROUP BY DATE(created_at)
+      ORDER BY date ASC
+    `, [req.tenantId]);
+    
+    res.json({ analytics: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Platform API Enterprise running on port ${PORT}`);
+  console.log(`📊 Database: ${db.options.database}`);
+  console.log(`🔐 JWT Secret: ${JWT_SECRET.substring(0, 10)}...`);
+});
