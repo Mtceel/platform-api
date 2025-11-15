@@ -813,6 +813,178 @@ app.get('/api/analytics/overview', authMiddleware, async (req, res) => {
 });
 
 // =======================
+// STATUS PAGE HEALTH CHECKS
+// =======================
+
+// Individual module health checks
+const checkServiceHealth = async (url, timeout = 2000) => {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    const start = Date.now();
+    const response = await fetch(url, { 
+      signal: controller.signal,
+      headers: { 'User-Agent': 'FV-StatusCheck/1.0' }
+    });
+    clearTimeout(timeoutId);
+    
+    const latency = Date.now() - start;
+    
+    if (response.ok) {
+      return { status: 'operational', latency };
+    } else {
+      return { status: 'degraded', latency };
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      return { status: 'degraded', latency: timeout };
+    }
+    return { status: 'outage', latency: null };
+  }
+};
+
+// Admin Dashboard health
+app.get('/api/health/admin', async (req, res) => {
+  const health = await checkServiceHealth('http://admin-dashboard-react.platform-services.svc.cluster.local:80');
+  res.json(health);
+});
+
+// Checkout/Orders health
+app.get('/api/health/checkout', async (req, res) => {
+  try {
+    const start = Date.now();
+    await db.query('SELECT 1 FROM orders LIMIT 1');
+    const latency = Date.now() - start;
+    res.json({ status: 'operational', latency });
+  } catch (err) {
+    res.json({ status: 'outage', latency: null });
+  }
+});
+
+// Reports/Analytics health
+app.get('/api/health/reports', async (req, res) => {
+  try {
+    const start = Date.now();
+    await db.query('SELECT COUNT(*) FROM orders WHERE created_at > NOW() - INTERVAL \'24 hours\'');
+    const latency = Date.now() - start;
+    res.json({ status: 'operational', latency });
+  } catch (err) {
+    res.json({ status: 'degraded', latency: null });
+  }
+});
+
+// Storefront health
+app.get('/api/health/storefront', async (req, res) => {
+  const health = await checkServiceHealth('http://storefront-renderer.platform-services.svc.cluster.local:80');
+  res.json(health);
+});
+
+// API health (self-check)
+app.get('/api/health/api', async (req, res) => {
+  try {
+    const start = Date.now();
+    await db.query('SELECT 1');
+    await redis.ping();
+    const latency = Date.now() - start;
+    res.json({ status: 'operational', latency });
+  } catch (err) {
+    res.json({ status: 'outage', latency: null });
+  }
+});
+
+// Third party services health (mock for now - replace with actual checks)
+app.get('/api/health/thirdparty', async (req, res) => {
+  // In production, check Stripe API, SendGrid, etc.
+  // For now, return operational
+  res.json({ status: 'operational', latency: 5 });
+});
+
+// Support system health (mock for now)
+app.get('/api/health/support', async (req, res) => {
+  // In production, check ticket system API
+  res.json({ status: 'operational', latency: 3 });
+});
+
+// POS health (mock for now)
+app.get('/api/health/pos', async (req, res) => {
+  // In production, check POS system API
+  res.json({ status: 'operational', latency: 4 });
+});
+
+// All modules aggregated health check
+app.get('/api/health/all-modules', async (req, res) => {
+  try {
+    const [admin, checkout, reports, storefront, api, thirdparty, support, pos] = await Promise.all([
+      checkServiceHealth('http://admin-dashboard-react.platform-services.svc.cluster.local:80'),
+      (async () => {
+        try {
+          const start = Date.now();
+          await db.query('SELECT 1 FROM orders LIMIT 1');
+          return { status: 'operational', latency: Date.now() - start };
+        } catch {
+          return { status: 'outage', latency: null };
+        }
+      })(),
+      (async () => {
+        try {
+          const start = Date.now();
+          await db.query('SELECT COUNT(*) FROM orders WHERE created_at > NOW() - INTERVAL \'24 hours\'');
+          return { status: 'operational', latency: Date.now() - start };
+        } catch {
+          return { status: 'degraded', latency: null };
+        }
+      })(),
+      checkServiceHealth('http://storefront-renderer.platform-services.svc.cluster.local:80'),
+      (async () => {
+        try {
+          const start = Date.now();
+          await db.query('SELECT 1');
+          await redis.ping();
+          return { status: 'operational', latency: Date.now() - start };
+        } catch {
+          return { status: 'outage', latency: null };
+        }
+      })(),
+      Promise.resolve({ status: 'operational', latency: 5 }), // Third party mock
+      Promise.resolve({ status: 'operational', latency: 3 }), // Support mock
+      Promise.resolve({ status: 'operational', latency: 4 })  // POS mock
+    ]);
+    
+    // Determine overall status
+    const statuses = [admin, checkout, reports, storefront, api, thirdparty, support, pos];
+    const hasOutage = statuses.some(s => s.status === 'outage');
+    const hasDegraded = statuses.some(s => s.status === 'degraded');
+    
+    let overall = 'operational';
+    if (hasOutage) overall = 'partial';
+    else if (hasDegraded) overall = 'degraded';
+    
+    res.json({
+      timestamp: new Date().toISOString(),
+      overall,
+      modules: {
+        admin,
+        checkout,
+        reports,
+        storefront,
+        api,
+        thirdparty,
+        support,
+        pos
+      }
+    });
+  } catch (err) {
+    console.error('Health check error:', err);
+    res.status(503).json({
+      timestamp: new Date().toISOString(),
+      overall: 'outage',
+      error: err.message
+    });
+  }
+});
+
+// =======================
 // STATUS PAGE METRICS API
 // =======================
 
