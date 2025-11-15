@@ -1009,6 +1009,36 @@ app.get('/api/admin/kubernetes', authMiddleware, superAdminMiddleware, async (re
   }
 });
 
+// Get current user info
+app.get('/api/user', authMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT u.id, u.email, u.full_name, u.role, t.id as tenant_id, t.subdomain, t.store_name FROM users u LEFT JOIN tenants t ON u.id = t.user_id WHERE u.id = $1',
+      [req.user.userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    
+    res.json({
+      id: user.id,
+      email: user.email,
+      fullName: user.full_name,
+      role: user.role,
+      subdomain: user.subdomain,
+      storeName: user.store_name,
+      storeUrl: user.subdomain ? `https://${user.subdomain}.fv-company.com` : null
+    });
+    
+  } catch (err) {
+    console.error('Get user error:', err);
+    res.status(500).json({ error: 'Failed to get user info' });
+  }
+});
+
 // === MERCHANT DASHBOARD ENDPOINTS ===
 
 // Feature flags endpoint (for progressive rollouts)
