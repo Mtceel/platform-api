@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: platform-api
-        image: mtceel/platform-api:latest
+        image: mtceel/platform-api:70347d1
         ports:
         - containerPort: 8080
           name: http
