@@ -39,14 +39,14 @@ jobs:
 
       - name: Update Kubernetes manifest
         run: |
-          # Find and update image tag in K8s manifests
-          find k8s -name '*.yaml' -exec sed -i "s|image: mtceel/platform-api:.*|image: mtceel/platform-api:${{ steps.vars.outputs.SHORT_SHA }}|" {} \; 2>/dev/null || true
+          # Update image tag in K8s manifests
+          sed -i "s|image: mtceel/platform-api:.*|image: mtceel/platform-api:${{ steps.vars.outputs.SHORT_SHA }}|" k8s/deployment.yaml
           
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
-          git add k8s/ || true
-          git commit -m "🚀 Deploy image ${{ steps.vars.outputs.SHORT_SHA }}" || exit 0
-          git push
+          git add k8s/deployment.yaml
+          git diff --staged --quiet || git commit -m "🚀 Deploy image ${{ steps.vars.outputs.SHORT_SHA }}"
+          git push || echo "No changes to push"
 
       - name: Deployment summary
         run: |
