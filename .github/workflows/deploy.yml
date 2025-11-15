@@ -1,0 +1,59 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract short SHA
+        id: vars
+        run: echo "SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            mtceel/platform-api:${{ steps.vars.outputs.SHORT_SHA }}
+            mtceel/platform-api:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Kubernetes manifest
+        run: |
+          # Find and update image tag in K8s manifests
+          find k8s -name '*.yaml' -exec sed -i "s|image: mtceel/platform-api:.*|image: mtceel/platform-api:${{ steps.vars.outputs.SHORT_SHA }}|" {} \; 2>/dev/null || true
+          
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add k8s/ || true
+          git commit -m "🚀 Deploy image ${{ steps.vars.outputs.SHORT_SHA }}" || exit 0
+          git push
+
+      - name: Deployment summary
+        run: |
+          echo "✅ Deployment initiated!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`mtceel/platform-api:${{ steps.vars.outputs.SHORT_SHA }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**ArgoCD will sync within 3 minutes**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Monitor at: https://argocd.fv-company.com" >> $GITHUB_STEP_SUMMARY
