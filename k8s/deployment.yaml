@@ -18,7 +18,7 @@ spec:
       serviceAccountName: platform-api
       containers:
       - name: platform-api
-        image: mtceel/platform-api:2aa9bdc
+        image: mtceel/platform-api:57b0eac
         ports:
         - containerPort: 8080
           name: http
