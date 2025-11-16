@@ -4,6 +4,7 @@ import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { createClient } from 'redis';
+import axios from 'axios';
 import { getEnabledFeatures, isFeatureEnabled } from './feature-flags.js';
 import { setupPageBuilderRoutes } from './page-builder.js';
 import { createDefaultTheme } from './default-theme.js';
@@ -14,6 +15,47 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json({ limit: '10mb' }));
+
+// Microservice URLs
+const SERVICES = {
+  products: 'http://products-service.platform-services.svc.cluster.local',
+  orders: 'http://orders-service.platform-services.svc.cluster.local',
+  customers: 'http://customers-service.platform-services.svc.cluster.local',
+  discounts: 'http://discounts-service.platform-services.svc.cluster.local',
+  analytics: 'http://analytics-service.platform-services.svc.cluster.local',
+  checkout: 'http://checkout-service.platform-services.svc.cluster.local',
+};
+
+// Proxy helper to forward requests to microservices
+const proxyToService = async (serviceUrl, req, res) => {
+  try {
+    const method = req.method.toLowerCase();
+    const path = req.path.replace('/api', '/api'); // Keep /api prefix
+    const url = `${serviceUrl}${path}`;
+    
+    const config = {
+      method,
+      url,
+      params: req.query,
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000,
+    };
+    
+    if (['post', 'put', 'patch'].includes(method)) {
+      config.data = req.body;
+    }
+    
+    console.log(`[PROXY] ${method.toUpperCase()} ${url}`);
+    const response = await axios(config);
+    return res.status(response.status).json(response.data);
+  } catch (error) {
+    console.error(`[PROXY ERROR]:`, error.message);
+    if (error.response) {
+      return res.status(error.response.status).json(error.response.data);
+    }
+    return res.status(503).json({ error: 'Service unavailable' });
+  }
+};
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-prod-CHANGE-THIS';
 const SUPER_ADMIN_EMAIL = process.env.SUPER_ADMIN_EMAIL || 'admin@fv-company.com';
@@ -1763,6 +1805,18 @@ app.get('/api/platform/metrics', async (req, res) => {
 // PAGE BUILDER ROUTES (Website Builder / Visual Editor)
 // ============================================================
 setupPageBuilderRoutes(app, db, authMiddleware);
+
+// ============================================================
+// MICROSERVICES PROXY ROUTES
+// Forward authenticated requests to backend microservices
+// ============================================================
+
+app.all('/api/products*', authMiddleware, (req, res) => proxyToService(SERVICES.products, req, res));
+app.all('/api/orders*', authMiddleware, (req, res) => proxyToService(SERVICES.orders, req, res));
+app.all('/api/customers*', authMiddleware, (req, res) => proxyToService(SERVICES.customers, req, res));
+app.all('/api/discounts*', authMiddleware, (req, res) => proxyToService(SERVICES.discounts, req, res));
+app.all('/api/analytics*', authMiddleware, (req, res) => proxyToService(SERVICES.analytics, req, res));
+app.all('/api/checkout*', authMiddleware, (req, res) => proxyToService(SERVICES.checkout, req, res));
 
 // Start server
 const PORT = process.env.PORT || 8080;
