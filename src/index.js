@@ -1015,6 +1015,57 @@ app.get('/api/admin/kubernetes', authMiddleware, superAdminMiddleware, async (re
   }
 });
 
+// Get microservices health status
+app.get('/api/admin/microservices', authMiddleware, superAdminMiddleware, async (req, res) => {
+  try {
+    const services = [
+      { name: 'Products Service', url: 'http://products-service.platform-services.svc.cluster.local/health', port: 80 },
+      { name: 'Checkout Service', url: 'http://checkout-service.platform-services.svc.cluster.local/health', port: 80 },
+      { name: 'Storefront Renderer', url: 'http://storefront-renderer.platform-services.svc.cluster.local/health', port: 80 },
+    ];
+
+    const results = await Promise.all(
+      services.map(async (service) => {
+        try {
+          const response = await fetch(service.url, { 
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+            signal: AbortSignal.timeout(3000) // 3s timeout
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            return {
+              name: service.name,
+              status: 'healthy',
+              uptime: data.uptime || 0,
+              connections: data.connections || {},
+              timestamp: data.timestamp
+            };
+          } else {
+            return {
+              name: service.name,
+              status: 'unhealthy',
+              error: `HTTP ${response.status}`
+            };
+          }
+        } catch (error) {
+          return {
+            name: service.name,
+            status: 'unreachable',
+            error: error.message
+          };
+        }
+      })
+    );
+
+    res.json({ services: results, timestamp: new Date().toISOString() });
+  } catch (err) {
+    console.error('Microservices health check error:', err);
+    res.status(500).json({ error: 'Failed to check microservices health', message: err.message });
+  }
+});
+
 // Get current user info
 app.get('/api/user', authMiddleware, async (req, res) => {
   try {
