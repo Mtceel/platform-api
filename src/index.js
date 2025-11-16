@@ -5,6 +5,8 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { createClient } from 'redis';
 import { getEnabledFeatures, isFeatureEnabled } from './feature-flags.js';
+import { setupPageBuilderRoutes } from './page-builder.js';
+import { createDefaultTheme } from './default-theme.js';
 
 const app = express();
 app.use(cors({
@@ -62,6 +64,13 @@ const authMiddleware = async (req, res, next) => {
     req.userId = decoded.userId;
     req.tenantId = decoded.tenantId;
     req.userRole = decoded.role || 'merchant';
+    
+    // Add user object for page-builder.js
+    req.user = {
+      userId: decoded.userId,
+      tenantId: decoded.tenantId,
+      role: decoded.role || 'merchant'
+    };
     
     // Audit log (skip for super admin with userId 0)
     if (req.userId !== 0) {
@@ -220,11 +229,8 @@ app.post('/api/signup', rateLimitMiddleware(10, 3600000), async (req, res) => {
     );
     const tenantId = tenantResult.rows[0].id;
     
-    // Create default theme
-    await client.query(
-      'INSERT INTO themes (tenant_id, name, is_active) VALUES ($1, $2, $3)',
-      [tenantId, 'Default', true]
-    );
+    // Create default theme and pages
+    await createDefaultTheme(client, tenantId);
     
     // Cache subdomain mapping
     await redis.set(`subdomain:${subdomain}`, tenantId.toString(), { EX: 86400 });
@@ -1701,6 +1707,11 @@ app.get('/api/platform/metrics', async (req, res) => {
     res.json({ totalTenants: 0, totalProducts: 0 });
   }
 });
+
+// ============================================================
+// PAGE BUILDER ROUTES (Website Builder / Visual Editor)
+// ============================================================
+setupPageBuilderRoutes(app, db, authMiddleware);
 
 // Start server
 const PORT = process.env.PORT || 8080;
