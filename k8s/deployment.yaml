@@ -15,6 +15,7 @@ spec:
       labels:
         app: platform-api
     spec:
+      serviceAccountName: platform-api
       containers:
       - name: platform-api
         image: mtceel/platform-api:bd00157
