@@ -260,7 +260,7 @@ export function setupPageBuilderRoutes(app, db, authMiddleware) {
    */
   app.post('/api/pages', authMiddleware, async (req, res) => {
     try {
-      const { slug, title, meta_description, theme_id, blocks } = req.body;
+      const { slug, title, meta_description, theme_id, content } = req.body;
       const tenantId = req.user.tenantId;
       
       if (!slug || !title) {
@@ -273,8 +273,8 @@ export function setupPageBuilderRoutes(app, db, authMiddleware) {
       }
       
       const result = await db.query(
-        'INSERT INTO pages (tenant_id, theme_id, slug, title, meta_description, blocks) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-        [tenantId, theme_id || null, slug, title, meta_description || '', blocks || []]
+        'INSERT INTO pages (tenant_id, theme_id, slug, title, meta_description, content) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+        [tenantId, theme_id || null, slug, title, meta_description || '', content || '[]']
       );
       
       res.status(201).json(result.rows[0]);
@@ -293,12 +293,12 @@ export function setupPageBuilderRoutes(app, db, authMiddleware) {
   app.put('/api/pages/:id', authMiddleware, async (req, res) => {
     try {
       const { id } = req.params;
-      const { slug, title, meta_description, theme_id, blocks, is_published, seo_settings } = req.body;
+      const { slug, title, meta_description, theme_id, content, is_published, seo_settings } = req.body;
       const tenantId = req.user.tenantId;
       
       // Save version before updating
       const existingPage = await db.query(
-        'SELECT blocks FROM pages WHERE id = $1 AND tenant_id = $2',
+        'SELECT content FROM pages WHERE id = $1 AND tenant_id = $2',
         [id, tenantId]
       );
       
@@ -311,8 +311,8 @@ export function setupPageBuilderRoutes(app, db, authMiddleware) {
         const nextVersion = (latestVersion.rows[0].max_version || 0) + 1;
         
         await db.query(
-          'INSERT INTO page_versions (page_id, version_number, blocks, created_by) VALUES ($1, $2, $3, $4)',
-          [id, nextVersion, existingPage.rows[0].blocks, req.user.userId]
+          'INSERT INTO page_versions (page_id, version_number, content, created_by) VALUES ($1, $2, $3, $4)',
+          [id, nextVersion, existingPage.rows[0].content, req.user.userId]
         );
       }
       
@@ -323,13 +323,13 @@ export function setupPageBuilderRoutes(app, db, authMiddleware) {
           title = COALESCE($2, title), 
           meta_description = COALESCE($3, meta_description),
           theme_id = COALESCE($4, theme_id),
-          blocks = COALESCE($5, blocks),
+          content = COALESCE($5, content),
           is_published = COALESCE($6, is_published),
           seo_settings = COALESCE($7, seo_settings),
           updated_at = NOW(),
           published_at = CASE WHEN $6 = true AND is_published = false THEN NOW() ELSE published_at END
          WHERE id = $8 AND tenant_id = $9 RETURNING *`,
-        [slug, title, meta_description, theme_id, blocks, is_published, seo_settings, id, tenantId]
+        [slug, title, meta_description, theme_id, content, is_published, seo_settings, id, tenantId]
       );
       
       if (result.rows.length === 0) {
@@ -454,7 +454,7 @@ export function setupPageBuilderRoutes(app, db, authMiddleware) {
       }
       
       const page = pageResult.rows[0];
-      const html = await renderBlocks(page.blocks, db);
+      const html = await renderBlocks(JSON.parse(page.content || '[]'), db);
       
       res.json({
         page: {
