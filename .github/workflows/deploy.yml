@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
@@ -40,13 +44,13 @@ jobs:
       - name: Update Kubernetes manifest
         run: |
           # Update image tag in K8s manifests
-          sed -i "s|image: mtceel/platform-api:.*|image: mtceel/platform-api:${{ steps.vars.outputs.SHORT_SHA }}|" k8s/deployment.yaml
+          sed -i "s|image: mtceel/platform-api:.*|image: mtceel/platform-api:${{ steps.vars.outputs.SHORT_SHA }}|g" k8s/deployment.yaml
           
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           git add k8s/deployment.yaml
           git diff --staged --quiet || git commit -m "🚀 Deploy image ${{ steps.vars.outputs.SHORT_SHA }}"
-          git push || echo "No changes to push"
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:main || echo "No changes to push"
 
       - name: Deployment summary
         run: |
