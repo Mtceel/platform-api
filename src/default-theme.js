@@ -39,7 +39,7 @@ export async function createDefaultTheme(db, tenantId) {
       {
         slug: 'home',
         title: 'Home',
-        meta_description: 'Welcome to our store',
+        seo_description: 'Welcome to our store',
         blocks: [
           {
             type: 'header',
@@ -113,7 +113,7 @@ export async function createDefaultTheme(db, tenantId) {
       {
         slug: 'about',
         title: 'About Us',
-        meta_description: 'Learn more about our company',
+        seo_description: 'Learn more about our company',
         blocks: [
           {
             type: 'header',
@@ -186,7 +186,7 @@ export async function createDefaultTheme(db, tenantId) {
       {
         slug: 'contact',
         title: 'Contact Us',
-        meta_description: 'Get in touch with us',
+        seo_description: 'Get in touch with us',
         blocks: [
           {
             type: 'header',
@@ -252,9 +252,9 @@ export async function createDefaultTheme(db, tenantId) {
     // Insert pages
     for (const page of pages) {
       await db.query(
-        `INSERT INTO pages (tenant_id, theme_id, slug, title, meta_description, blocks, is_published)
+        `INSERT INTO pages (tenant_id, theme_id, slug, title, seo_description, blocks, is_published)
          VALUES ($1, $2, $3, $4, $5, $6, true)`,
-        [tenantId, themeId, page.slug, page.title, page.meta_description, JSON.stringify(page.blocks)]
+        [tenantId, themeId, page.slug, page.title, page.seo_description, JSON.stringify(page.blocks)]
       );
     }
     
