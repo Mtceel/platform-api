@@ -45,15 +45,27 @@ const proxyToService = async (serviceUrl, req, res) => {
       config.data = req.body;
     }
     
-    console.log(`[PROXY] ${method.toUpperCase()} ${url}`);
+    console.log(`[PROXY] ${method.toUpperCase()} ${url}`, {
+      query: req.query,
+      body: req.body,
+      params: config.params
+    });
+    
     const response = await axios(config);
+    console.log(`[PROXY SUCCESS] ${response.status}`, response.data);
     return res.status(response.status).json(response.data);
   } catch (error) {
     console.error(`[PROXY ERROR]:`, error.message);
+    console.error(`[PROXY ERROR DETAILS]:`, {
+      url: error.config?.url,
+      method: error.config?.method,
+      data: error.config?.data,
+      response: error.response?.data
+    });
     if (error.response) {
       return res.status(error.response.status).json(error.response.data);
     }
-    return res.status(503).json({ error: 'Service unavailable' });
+    return res.status(503).json({ error: 'Service unavailable', details: error.message });
   }
 };
 
