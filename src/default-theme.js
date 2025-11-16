@@ -252,7 +252,7 @@ export async function createDefaultTheme(db, tenantId) {
     // Insert pages
     for (const page of pages) {
       await db.query(
-        `INSERT INTO pages (tenant_id, theme_id, slug, title, seo_description, blocks, is_published)
+        `INSERT INTO pages (tenant_id, theme_id, slug, title, seo_description, content, is_published)
          VALUES ($1, $2, $3, $4, $5, $6, true)`,
         [tenantId, themeId, page.slug, page.title, page.seo_description, JSON.stringify(page.blocks)]
       );
