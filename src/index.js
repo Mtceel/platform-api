@@ -227,6 +227,18 @@ app.get('/api/status', async (req, res) => {
   }
 });
 
+// ============================================================
+// MICROSERVICES PROXY ROUTES - MUST BE BEFORE OTHER ROUTES
+// Forward authenticated requests to backend microservices
+// ============================================================
+
+app.all('/api/products*', authMiddleware, (req, res) => proxyToService(SERVICES.products, req, res));
+app.all('/api/orders*', authMiddleware, (req, res) => proxyToService(SERVICES.orders, req, res));
+app.all('/api/customers*', authMiddleware, (req, res) => proxyToService(SERVICES.customers, req, res));
+app.all('/api/discounts*', authMiddleware, (req, res) => proxyToService(SERVICES.discounts, req, res));
+app.all('/api/analytics*', authMiddleware, (req, res) => proxyToService(SERVICES.analytics, req, res));
+app.all('/api/checkout*', authMiddleware, (req, res) => proxyToService(SERVICES.checkout, req, res));
+
 // === AUTH ENDPOINTS ===
 
 app.post('/api/signup', rateLimitMiddleware(10, 3600000), async (req, res) => {
@@ -1185,346 +1197,13 @@ app.get('/api/dashboard/stats', authMiddleware, async (req, res) => {
   }
 });
 
-// === PRODUCTS ===
+// ============================================================
+// PRODUCTS, ORDERS, CUSTOMERS, DISCOUNTS, ANALYTICS, CHECKOUT
+// These endpoints are now handled by microservices via proxy routes below
+// ============================================================
 
-app.get('/api/products', authMiddleware, async (req, res) => {
-  try {
-    const result = await db.query(
-      'SELECT * FROM products WHERE tenant_id = $1 ORDER BY created_at DESC',
-      [req.tenantId]
-    );
-    res.json({ products: result.rows });
-  } catch (err) {
-    console.error('Get products error:', err);
-    res.status(500).json({ error: 'Failed to fetch products' });
-  }
-});
-
-app.post('/api/products', authMiddleware, rateLimitMiddleware(50, 60000), async (req, res) => {
-  const { title, description, price, inventory, sku, image_url, category, tags } = req.body;
-  
-  if (!title || price === undefined) {
-    return res.status(400).json({ error: 'Title and price are required' });
-  }
-  
-  try {
-    const result = await db.query(
-      `INSERT INTO products (tenant_id, title, description, price, inventory, sku, image_url, category, tags, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-      [req.tenantId, title, description, price, inventory || 0, sku, image_url, category, tags, 'active']
-    );
-    
-    res.json({ success: true, product: result.rows[0] });
-  } catch (err) {
-    console.error('Create product error:', err);
-    res.status(500).json({ error: 'Failed to create product' });
-  }
-});
-
-app.put('/api/products/:id', authMiddleware, async (req, res) => {
-  const { id } = req.params;
-  const { title, description, price, inventory, sku, image_url, category, tags, status } = req.body;
-  
-  try {
-    const result = await db.query(
-      `UPDATE products 
-       SET title = COALESCE($1, title),
-           description = COALESCE($2, description),
-           price = COALESCE($3, price),
-           inventory = COALESCE($4, inventory),
-           sku = COALESCE($5, sku),
-           image_url = COALESCE($6, image_url),
-           category = COALESCE($7, category),
-           tags = COALESCE($8, tags),
-           status = COALESCE($9, status)
-       WHERE id = $10 AND tenant_id = $11
-       RETURNING *`,
-      [title, description, price, inventory, sku, image_url, category, tags, status, id, req.tenantId]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Product not found' });
-    }
-    
-    res.json({ success: true, product: result.rows[0] });
-  } catch (err) {
-    console.error('Update product error:', err);
-    res.status(500).json({ error: 'Failed to update product' });
-  }
-});
-
-app.delete('/api/products/:id', authMiddleware, async (req, res) => {
-  const { id } = req.params;
-  
-  try {
-    const result = await db.query('DELETE FROM products WHERE id = $1 AND tenant_id = $2 RETURNING id', [id, req.tenantId]);
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Product not found' });
-    }
-    
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Delete product error:', err);
-    res.status(500).json({ error: 'Failed to delete product' });
-  }
-});
-
-// === ORDERS ===
-
-app.get('/api/orders', authMiddleware, async (req, res) => {
-  try {
-    const result = await db.query(
-      'SELECT * FROM orders WHERE tenant_id = $1 ORDER BY created_at DESC',
-      [req.tenantId]
-    );
-    res.json({ orders: result.rows });
-  } catch (err) {
-    console.error('Get orders error:', err);
-    res.status(500).json({ error: 'Failed to fetch orders' });
-  }
-});
-
-app.patch('/api/orders/:id/status', authMiddleware, async (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body;
-  
-  if (!['pending', 'processing', 'completed', 'cancelled'].includes(status)) {
-    return res.status(400).json({ error: 'Invalid status' });
-  }
-  
-  try {
-    await db.query(
-      'UPDATE orders SET status = $1 WHERE id = $2 AND tenant_id = $3',
-      [status, id, req.tenantId]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Update order status error:', err);
-    res.status(500).json({ error: 'Failed to update order' });
-  }
-});
-
-// === STOREFRONT PUBLIC ENDPOINTS ===
-
-app.get('/api/storefront/:subdomain', async (req, res) => {
-  const { subdomain } = req.params;
-  
-  try {
-    // Check cache first
-    let tenantId = await redis.get(`subdomain:${subdomain}`);
-    
-    if (!tenantId) {
-      // Fallback to database
-      const tenantResult = await db.query(
-        'SELECT id, store_name, custom_domain, status FROM tenants WHERE subdomain = $1',
-        [subdomain]
-      );
-      
-      if (tenantResult.rows.length === 0) {
-        return res.status(404).json({ error: 'Store not found' });
-      }
-      
-      const tenant = tenantResult.rows[0];
-      
-      if (tenant.status !== 'active') {
-        return res.status(403).json({ error: 'Store is not active' });
-      }
-      
-      tenantId = tenant.id;
-      
-      // Cache for 1 hour
-      await redis.set(`subdomain:${subdomain}`, tenantId.toString(), { EX: 3600 });
-    }
-    
-    // Fetch store data
-    const storeResult = await db.query(
-      'SELECT id, store_name, subdomain, custom_domain FROM tenants WHERE id = $1',
-      [tenantId]
-    );
-    
-    const productsResult = await db.query(
-      'SELECT id, title, description, price, inventory, image_url, category, tags FROM products WHERE tenant_id = $1 AND status = $2 ORDER BY created_at DESC',
-      [tenantId, 'active']
-    );
-    
-    res.json({
-      store: storeResult.rows[0],
-      products: productsResult.rows
-    });
-    
-  } catch (err) {
-    console.error('Storefront error:', err);
-    res.status(500).json({ error: 'Failed to load store' });
-  }
-});
-
-app.post('/api/checkout', rateLimitMiddleware(10, 60000), async (req, res) => {
-  const { subdomain, cart, customerName, customerEmail, shippingAddress } = req.body;
-  
-  if (!subdomain || !cart || cart.length === 0 || !customerEmail) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-  
-  const client = await db.connect();
-  
-  try {
-    await client.query('BEGIN');
-    
-    // Get tenant
-    const tenantResult = await client.query('SELECT id FROM tenants WHERE subdomain = $1', [subdomain]);
-    if (tenantResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Store not found' });
-    }
-    const tenantId = tenantResult.rows[0].id;
-    
-    // Calculate total and verify inventory
-    let total = 0;
-    for (const item of cart) {
-      const productResult = await client.query(
-        'SELECT price, inventory FROM products WHERE id = $1 AND tenant_id = $2',
-        [item.id, tenantId]
-      );
-      
-      if (productResult.rows.length === 0) {
-        throw new Error(`Product ${item.id} not found`);
-      }
-      
-      const product = productResult.rows[0];
-      
-      if (product.inventory < item.quantity) {
-        throw new Error(`Insufficient inventory for product ${item.id}`);
-      }
-      
-      total += product.price * item.quantity;
-      
-      // Decrease inventory
-      await client.query(
-        'UPDATE products SET inventory = inventory - $1 WHERE id = $2',
-        [item.quantity, item.id]
-      );
-    }
-    
-    // Create order
-    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
-    const orderResult = await client.query(
-      `INSERT INTO orders (tenant_id, order_number, customer_email, customer_name, shipping_address, total, items, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [tenantId, orderNumber, customerEmail, customerName, shippingAddress, total, JSON.stringify(cart), 'pending']
-    );
-    
-    await client.query('COMMIT');
-    
-    res.json({
-      success: true,
-      order: orderResult.rows[0]
-    });
-    
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Checkout error:', err);
-    res.status(500).json({ error: err.message || 'Checkout failed' });
-  } finally {
-    client.release();
-  }
-});
-
-// === THEMES & CUSTOMIZATION ===
-
-app.get('/api/themes', authMiddleware, async (req, res) => {
-  try {
-    const result = await db.query(
-      'SELECT * FROM themes WHERE tenant_id = $1 ORDER BY created_at DESC',
-      [req.tenantId]
-    );
-    res.json({ themes: result.rows });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch themes' });
-  }
-});
-
-app.post('/api/themes', authMiddleware, async (req, res) => {
-  const { name, settings } = req.body;
-  
-  try {
-    const result = await db.query(
-      'INSERT INTO themes (tenant_id, name, settings) VALUES ($1, $2, $3) RETURNING *',
-      [req.tenantId, name, settings || {}]
-    );
-    res.json({ success: true, theme: result.rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to create theme' });
-  }
-});
-
-app.patch('/api/themes/:id/activate', authMiddleware, async (req, res) => {
-  const { id } = req.params;
-  
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query('UPDATE themes SET is_active = false WHERE tenant_id = $1', [req.tenantId]);
-    await client.query('UPDATE themes SET is_active = true WHERE id = $1 AND tenant_id = $2', [id, req.tenantId]);
-    await client.query('COMMIT');
-    
-    res.json({ success: true });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: 'Failed to activate theme' });
-  } finally {
-    client.release();
-  }
-});
-
-// === CUSTOM DOMAINS ===
-
-app.post('/api/custom-domain', authMiddleware, async (req, res) => {
-  const { domain } = req.body;
-  
-  if (!domain) {
-    return res.status(400).json({ error: 'Domain is required' });
-  }
-  
-  try {
-    await db.query(
-      'UPDATE tenants SET custom_domain = $1 WHERE id = $2',
-      [domain, req.tenantId]
-    );
-    
-    // Cache domain mapping
-    await redis.set(`domain:${domain}`, req.tenantId.toString(), { EX: 86400 });
-    
-    res.json({ 
-      success: true, 
-      message: 'Custom domain added. Please point your DNS CNAME to fv-company.com'
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to add custom domain' });
-  }
-});
-
-// === ANALYTICS ===
-
-app.get('/api/analytics/overview', authMiddleware, async (req, res) => {
-  const { days = 30 } = req.query;
-  
-  try {
-    const result = await db.query(`
-      SELECT 
-        DATE(created_at) as date,
-        COUNT(*) as orders,
-        SUM(total) as revenue
-      FROM orders
-      WHERE tenant_id = $1 AND created_at > NOW() - INTERVAL '${parseInt(days)} days'
-      GROUP BY DATE(created_at)
-      ORDER BY date ASC
-    `, [req.tenantId]);
-    
-    res.json({ analytics: result.rows });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch analytics' });
-  }
-});
+// OLD MONOLITHIC ROUTES REMOVED - NOW USING MICROSERVICES
+// See proxy routes at the bottom of this file
 
 // =======================
 // STATUS PAGE HEALTH CHECKS
@@ -1818,17 +1497,8 @@ app.get('/api/platform/metrics', async (req, res) => {
 // ============================================================
 setupPageBuilderRoutes(app, db, authMiddleware);
 
-// ============================================================
-// MICROSERVICES PROXY ROUTES
-// Forward authenticated requests to backend microservices
-// ============================================================
-
-app.all('/api/products*', authMiddleware, (req, res) => proxyToService(SERVICES.products, req, res));
-app.all('/api/orders*', authMiddleware, (req, res) => proxyToService(SERVICES.orders, req, res));
-app.all('/api/customers*', authMiddleware, (req, res) => proxyToService(SERVICES.customers, req, res));
-app.all('/api/discounts*', authMiddleware, (req, res) => proxyToService(SERVICES.discounts, req, res));
-app.all('/api/analytics*', authMiddleware, (req, res) => proxyToService(SERVICES.analytics, req, res));
-app.all('/api/checkout*', authMiddleware, (req, res) => proxyToService(SERVICES.checkout, req, res));
+// Note: Microservices proxy routes are defined at the top of the file (after health checks)
+// to ensure they are matched first before any other routes
 
 // Start server
 const PORT = process.env.PORT || 8080;
