@@ -24,6 +24,7 @@ const SERVICES = {
   discounts: 'http://discounts-service.platform-services.svc.cluster.local',
   analytics: 'http://analytics-service.platform-services.svc.cluster.local',
   checkout: 'http://checkout-service.platform-services.svc.cluster.local',
+  email: 'http://email-service.platform-services.svc.cluster.local',
 };
 
 // Proxy helper to forward requests to microservices
@@ -238,6 +239,12 @@ app.all('/api/customers*', authMiddleware, (req, res) => proxyToService(SERVICES
 app.all('/api/discounts*', authMiddleware, (req, res) => proxyToService(SERVICES.discounts, req, res));
 app.all('/api/analytics*', authMiddleware, (req, res) => proxyToService(SERVICES.analytics, req, res));
 app.all('/api/checkout*', authMiddleware, (req, res) => proxyToService(SERVICES.checkout, req, res));
+
+// Email endpoints - subscribers endpoint is public for forms, rest requires auth
+app.post('/api/subscribers', (req, res) => proxyToService(SERVICES.email, req, res));
+app.all('/api/subscribers*', authMiddleware, (req, res) => proxyToService(SERVICES.email, req, res));
+app.all('/api/email-settings*', authMiddleware, (req, res) => proxyToService(SERVICES.email, req, res));
+app.all('/api/campaigns*', authMiddleware, (req, res) => proxyToService(SERVICES.email, req, res));
 
 // === AUTH ENDPOINTS ===
 
