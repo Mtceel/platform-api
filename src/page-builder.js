@@ -293,7 +293,7 @@ export function setupPageBuilderRoutes(app, db, authMiddleware) {
   app.put('/api/pages/:id', authMiddleware, async (req, res) => {
     try {
       const { id } = req.params;
-      const { slug, title, meta_description, theme_id, content, is_published, seo_settings } = req.body;
+      const { slug, title, seo_description, theme_id, content, is_published } = req.body;
       const tenantId = req.user.tenantId;
       
       // Save version before updating
@@ -317,20 +317,18 @@ export function setupPageBuilderRoutes(app, db, authMiddleware) {
         );
       }
       
-      // Update page
+      // Update page (match actual table schema: seo_description, no seo_settings/published_at)
       const result = await db.query(
         `UPDATE pages SET 
           slug = COALESCE($1, slug), 
           title = COALESCE($2, title), 
-          meta_description = COALESCE($3, meta_description),
+          seo_description = COALESCE($3, seo_description),
           theme_id = COALESCE($4, theme_id),
           content = COALESCE($5, content),
           is_published = COALESCE($6, is_published),
-          seo_settings = COALESCE($7, seo_settings),
-          updated_at = NOW(),
-          published_at = CASE WHEN $6 = true AND is_published = false THEN NOW() ELSE published_at END
-         WHERE id = $8 AND tenant_id = $9 RETURNING *`,
-        [slug, title, meta_description, theme_id, content, is_published, seo_settings, id, tenantId]
+          updated_at = NOW()
+         WHERE id = $7 AND tenant_id = $8 RETURNING *`,
+        [slug, title, seo_description, theme_id, content, is_published, id, tenantId]
       );
       
       if (result.rows.length === 0) {
