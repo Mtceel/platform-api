@@ -310,8 +310,9 @@ export function setupPageBuilderRoutes(app, db, authMiddleware) {
         
         const nextVersion = (latestVersion.rows[0].max_version || 0) + 1;
         
+        // Save version with blocks (page_versions table uses 'blocks' column, not 'content')
         await db.query(
-          'INSERT INTO page_versions (page_id, version_number, content, created_by) VALUES ($1, $2, $3, $4)',
+          'INSERT INTO page_versions (page_id, version_number, blocks, created_by) VALUES ($1, $2, $3, $4)',
           [id, nextVersion, existingPage.rows[0].content, req.user.userId]
         );
       }
