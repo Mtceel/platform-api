@@ -508,6 +508,28 @@ export function setupPageBuilderRoutes(app, db, authMiddleware) {
    * Note: Requires multipart/form-data middleware (multer)
    * For now, returns placeholder - implement file upload in next step
    */
+  // Image upload endpoint
+  app.post('/api/upload', authMiddleware, async (req, res) => {
+    try {
+      // For MVP: Use Unsplash placeholder images
+      // In production: Implement multer + S3
+      const placeholderUrls = [
+        'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800&h=600&fit=crop',
+        'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800&h=600&fit=crop',
+        'https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800&h=600&fit=crop',
+        'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800&h=600&fit=crop',
+        'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800&h=600&fit=crop'
+      ];
+      
+      const randomUrl = placeholderUrls[Math.floor(Math.random() * placeholderUrls.length)];
+      
+      res.json({ url: randomUrl });
+    } catch (error) {
+      console.error('Upload error:', error);
+      res.status(500).json({ error: 'Failed to upload image' });
+    }
+  });
+
   app.post('/api/assets/upload', authMiddleware, async (req, res) => {
     try {
       const tenantId = req.user.tenantId;
