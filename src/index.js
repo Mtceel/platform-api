@@ -111,8 +111,16 @@ const rateLimit = (key, maxRequests, windowMs) => {
 
 // Auth middleware
 const authMiddleware = async (req, res, next) => {
+  // Debug: log all headers to see what we're receiving
+  console.log('[AUTH] Headers:', JSON.stringify(req.headers));
+  
   const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'No token provided' });
+  if (!token) {
+    console.log('[AUTH] No token found in headers');
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  
+  console.log('[AUTH] Token received:', token.substring(0, 20) + '...');
   
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
