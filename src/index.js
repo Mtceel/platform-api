@@ -428,6 +428,24 @@ app.get('/api/dashboard/stats', authMiddleware, async (req, res) => {
   }
 });
 
+app.get('/api/tenant/info', authMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT id, subdomain, name, created_at FROM tenants WHERE id = $1',
+      [req.tenantId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Tenant info error:', err);
+    res.status(500).json({ error: 'Failed to fetch tenant info' });
+  }
+});
+
 // === PRODUCTS ===
 
 app.get('/api/products', authMiddleware, async (req, res) => {
